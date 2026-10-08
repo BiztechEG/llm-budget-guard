@@ -1,8 +1,13 @@
 import asyncio
+import gc
 import logging
+import threading
+import time
 from decimal import Decimal
 
+import anthropic
 import httpx2
+import openai
 import pytest
 
 from budget_guard import (
@@ -270,3 +275,92 @@ def test_generator_arguments_are_fingerprinted_by_content(server, openai_client,
     with pytest.raises(LoopDetected):
         client.chat.completions.create(model="gpt-6-luna", messages=generators[2])
     assert server.requests[0]["messages"] == MSG  # the SDK still received the messages
+
+
+# -- calls in flight ----------------------------------------------------------------
+
+def slow_reply(model, prompt, completion, delay=0.2):
+    def respond(body):
+        time.sleep(delay)
+        return httpx2.Response(200, json=chat_completion(model, prompt, completion))
+
+    return respond
+
+
+def test_parallel_calls_cannot_all_pass_the_limit(server, openai_client, clock):
+    # Each call can cost $0.10 (200K output tokens of gpt-6-luna), the same as the whole limit.
+    server.responder = slow_reply("gpt-6-luna", 0, 200_000)
+    budget = make_guard(clock, limits=Limits(per_user="0.10"))
+    client = guard(openai_client, user="u1", budget=budget)
+    blocked = []
+
+    def call(i):
+        try:
+            client.chat.completions.create(
+                model="gpt-6-luna", messages=[{"role": "user", "content": str(i)}], max_tokens=200_000
+            )
+        except BudgetExceeded as err:
+            blocked.append(err)
+
+    threads = [threading.Thread(target=call, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(server.requests) == 1 and len(blocked) == 19
+    assert budget.spent(user="u1") == Decimal("0.10")
+    assert budget.storage.get("pending:2026-10-08:user:u1") == 0  # nothing left held
+
+
+def test_parallel_async_calls_cannot_all_pass_the_limit(server, async_openai_client, clock):
+    server.responder = lambda body: httpx2.Response(200, json=chat_completion("gpt-6-luna", 0, 200_000))
+    budget = make_guard(clock, limits=Limits(daily_total="0.10"))
+    client = guard(async_openai_client, budget=budget)
+
+    async def run():
+        first = client.chat.completions.create(model="gpt-6-luna", messages=MSG, max_tokens=200_000)
+        # `first` holds its estimate until it finishes, so a second call made meanwhile is refused.
+        with pytest.raises(BudgetExceeded) as err:
+            await client.chat.completions.create(
+                model="gpt-6-luna", messages=[{"role": "user", "content": "2"}], max_tokens=200_000
+            )
+        await first
+        return err.value
+
+    err = asyncio.run(run())
+    assert err.reserved == Decimal("0.1000002")  # 200K output tokens plus 2 input tokens
+    assert "held by calls still running" in str(err)
+    assert budget.spent() == Decimal("0.10")
+
+
+def test_reservation_is_released_when_the_request_fails(server, openai_client, clock):
+    server.responder = lambda body: httpx2.Response(500, json={"error": {"message": "boom"}})
+    budget = make_guard(clock, limits=Limits(per_user="0.10"))
+    client = guard(openai_client, user="u1", budget=budget)
+    with pytest.raises(openai.InternalServerError):
+        ask(client)
+    assert budget.storage.get("pending:2026-10-08:user:u1") == 0
+    assert budget.spent(user="u1") == 0
+
+
+def test_reservation_is_released_when_a_stream_helper_fails(server, anthropic_client, clock):
+    error = {"type": "error", "error": {"type": "api_error", "message": "boom"}}
+    server.responder = lambda body: httpx2.Response(500, json=error)
+    budget = make_guard(clock, limits=Limits(per_user="1"))
+    client = guard(anthropic_client, user="u1", budget=budget)
+    with pytest.raises(anthropic.InternalServerError):
+        with client.messages.stream(model="claude-haiku-4-5", max_tokens=10, messages=MSG):
+            pass
+    assert budget.storage.get("pending:2026-10-08:user:u1") == 0
+
+
+def test_reservation_is_released_when_a_stream_helper_is_never_entered(server, anthropic_client, clock):
+    budget = make_guard(clock, limits=Limits(per_user="1"))
+    client = guard(anthropic_client, user="u1", budget=budget)
+    manager = client.messages.stream(model="claude-haiku-4-5", max_tokens=10, messages=MSG)
+    assert budget.storage.get("pending:2026-10-08:user:u1") > 0
+    del manager
+    gc.collect()
+    assert budget.storage.get("pending:2026-10-08:user:u1") == 0
+    assert server.requests == []

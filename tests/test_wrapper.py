@@ -141,13 +141,14 @@ def test_openai_chat_stream_keeps_usage_chunk_when_caller_asked(server, openai_c
     assert budget.spent() == Decimal("0.60")
 
 
-def test_stream_closed_early_does_not_raise(server, openai_client, budget):
-    # Nothing billed is seen before close, so nothing is counted, but closing must not raise.
+def test_openai_stream_closed_early_is_charged_its_estimate(server, openai_client, budget):
+    # OpenAI reports usage only in the last chunk, so a stream closed early is counted at its estimate.
     server.responder = lambda body: stream_response(sse(chat_chunks("gpt-6-luna", M, M, with_usage=True), done=True))
     client = guard(openai_client, budget=budget)
-    with client.chat.completions.create(model="gpt-6-luna", messages=MSG, stream=True) as stream:
+    with client.chat.completions.create(model="gpt-6-luna", messages=MSG, stream=True, max_tokens=1000) as stream:
         next(iter(stream))
-    assert budget.spent() == 0
+    # 6 characters of input ("user", "hi") is 2 tokens; output is the full max_tokens.
+    assert budget.spent() == Decimal("0.0000002") + Decimal("0.0005")
 
 
 def test_openai_responses_stream(server, openai_client, budget):

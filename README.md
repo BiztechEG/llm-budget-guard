@@ -61,8 +61,11 @@ can, for example, block loops but only warn on spend.
 How the checks behave:
 
 - Limits are daily and reset at midnight UTC.
-- The call that crosses a cap is allowed, because its cost is only known once it returns. Calls running
-  at the same moment can each overshoot by one call.
+- The call that crosses a cap is allowed, because its cost is only known once it returns.
+- Calls still running count toward each cap at an estimated cost, so a burst of parallel calls can't all
+  get through before the first one is recorded. The estimate is the request's text at about 3 characters
+  a token, plus its `max_tokens` (or `reserve_output_tokens=`, 1024 by default, when it sets none).
+  Setting `max_tokens` on your calls makes this protection tighter.
 - A limit of `0` blocks that user or feature entirely.
 - A loop is the same request (model, messages and options) for the same user and feature, sent more than
   `max_repeats` times inside `window_seconds`. Two users asking the same question never count together.
@@ -104,8 +107,8 @@ provider, model, user, feature, token usage and cost.
 
 Streams are counted when they finish, are closed, or are dropped part-way. For OpenAI chat streams the
 guard turns on `stream_options.include_usage` and hides the extra usage chunk unless you asked for it
-yourself. OpenAI only reports usage at the end of a stream, so a stream cut short isn't counted; a warning
-is logged instead. `client.with_options(...)` and Anthropic's `client.with_middleware(...)` stay guarded.
+yourself. OpenAI only reports usage at the end of a stream, so a stream cut short is counted at its
+estimated cost (see above) and a warning is logged. `client.with_options(...)` and Anthropic's `client.with_middleware(...)` stay guarded.
 
 `with_raw_response` and `with_streaming_response` calls go through the limit and loop checks, but their
 cost isn't counted yet. Not tracked at all yet: batches, Anthropic's `tool_runner`, embeddings, images and

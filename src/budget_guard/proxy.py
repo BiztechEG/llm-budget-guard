@@ -164,33 +164,46 @@ class GuardedClient:
                 if isinstance(value, Iterator):  # generators can be read only once, and the SDK still needs them
                     kwargs[key] = list(value)
             if kind.startswith(UNMETERED):
-                guard.before_call(provider, kind[len(UNMETERED):], kwargs, ctx)
+                # Nothing tells us when these finish, so nothing is held for them.
+                guard.before_call(provider, kind[len(UNMETERED):], kwargs, ctx, reserve=False)
                 _warn_unmetered(provider, path)
                 return method(*args, **kwargs)
             hide_usage_chunk = _prepare_kwargs(kind, kwargs)
-            guard.before_call(provider, kind, kwargs, ctx)
+            reservation = guard.before_call(provider, kind, kwargs, ctx)
 
             fallback_model = kwargs.get("model") if isinstance(kwargs.get("model"), str) else None
 
             def on_done(response_like: Any) -> None:
-                guard.record_response(response_like, provider, ctx, fallback_model)
+                guard.record_response(response_like, provider, ctx, fallback_model, reservation)
+
+            def on_error() -> None:
+                guard.release(reservation)  # the request failed before anything was billed
 
             def handle(result: Any) -> Any:
                 if kind.endswith("_helper"):
-                    return TrackedStreamManager(result, on_done)
+                    return TrackedStreamManager(result, on_done, on_error)
                 if kwargs.get("stream") is True:
                     acc = ACCUMULATORS[kind]()
                     skip = is_injected_usage_chunk if hide_usage_chunk else None
                     wrapper = AsyncTrackedStream if hasattr(result, "__aiter__") else TrackedStream
                     return wrapper(result, acc, on_done, skip)
-                guard.record_response(result, provider, ctx, fallback_model)
+                guard.record_response(result, provider, ctx, fallback_model, reservation)
                 return result
 
-            result = method(*args, **kwargs)
+            try:
+                result = method(*args, **kwargs)
+            except BaseException:
+                on_error()
+                raise
             if inspect.isawaitable(result):
 
                 async def finish() -> Any:
-                    return handle(await result)
+                    try:
+                        response = await result
+                    except BaseException:
+                        on_error()
+                        raise
+                    return handle(response)
 
                 return finish()
             return handle(result)

@@ -24,13 +24,17 @@ class BudgetError(Exception):
 
 
 class BudgetExceeded(BudgetError):
-    def __init__(self, scope: str, name: Optional[str], limit: Decimal, spent: Decimal):
+    def __init__(
+        self, scope: str, name: Optional[str], limit: Decimal, spent: Decimal, reserved: Decimal = Decimal(0)
+    ):
         self.scope = scope  # "user", "feature" or "daily"
         self.name = name
         self.limit = limit
         self.spent = spent
+        self.reserved = reserved  # estimated cost of calls still running
         who = "Daily total" if scope == "daily" else f"Daily budget for {scope} {name!r}"
-        super().__init__(f"{who} exceeded: spent ${spent:.4f} of ${limit:.4f}.")
+        held = f" (+${reserved:.4f} held by calls still running)" if reserved else ""
+        super().__init__(f"{who} exceeded: spent ${spent:.4f}{held} of ${limit:.4f}.")
 
 
 class LoopDetected(BudgetError):

@@ -198,30 +198,61 @@ def _snapshot(stream: Any) -> Optional[Dict[str, Any]]:
 class TrackedStreamManager:
     """Wraps `client.messages.stream(...)`-style helpers; records cost when the `with` block exits."""
 
-    def __init__(self, manager: Any, on_done: OnDone):
+    def __init__(self, manager: Any, on_done: OnDone, on_error: Optional[Callable[[], None]] = None):
         self._bg_manager = manager
         self._bg_on_done = on_done
+        self._bg_on_error = on_error
         self._bg_stream: Any = None
+        self._bg_settled = False
+
+    def _bg_finish(self) -> None:
+        if not self._bg_settled:
+            self._bg_settled = True
+            self._bg_on_done(_snapshot(self._bg_stream))
+
+    def _bg_failed(self) -> None:
+        if not self._bg_settled:
+            self._bg_settled = True
+            if self._bg_on_error is not None:
+                self._bg_on_error()
 
     def __enter__(self) -> Any:
-        self._bg_stream = self._bg_manager.__enter__()
+        try:
+            self._bg_stream = self._bg_manager.__enter__()  # the request is sent here
+        except BaseException:
+            self._bg_failed()
+            raise
         return self._bg_stream
 
     def __exit__(self, *exc: Any) -> Any:
         try:
             return self._bg_manager.__exit__(*exc)
         finally:
-            self._bg_on_done(_snapshot(self._bg_stream))
+            self._bg_finish()
 
     async def __aenter__(self) -> Any:
-        self._bg_stream = await self._bg_manager.__aenter__()
+        try:
+            self._bg_stream = await self._bg_manager.__aenter__()
+        except BaseException:
+            self._bg_failed()
+            raise
         return self._bg_stream
 
     async def __aexit__(self, *exc: Any) -> Any:
         try:
             return await self._bg_manager.__aexit__(*exc)
         finally:
-            self._bg_on_done(_snapshot(self._bg_stream))
+            self._bg_finish()
+
+    def __del__(self) -> None:
+        # Never entered means nothing was sent; entered but never exited still cost money.
+        try:
+            if self._bg_stream is None:
+                self._bg_failed()
+            else:
+                self._bg_finish()
+        except Exception:
+            pass
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_bg_"):
