@@ -8,7 +8,7 @@ from .pricing import ModelPrice, PricingTable, UnknownModelError
 from .storage import InMemoryStorage, Storage
 from .usage import Usage, extract_usage
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 __all__ = [
     "BudgetError",
