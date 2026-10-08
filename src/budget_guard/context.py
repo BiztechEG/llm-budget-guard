@@ -13,6 +13,13 @@ class CallContext:
     user: Optional[str] = None
     feature: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        # Ids often arrive as ints (request.user.id); keep them as text so limits and totals match either way.
+        for name in ("user", "feature"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                object.__setattr__(self, name, str(value))
+
     def merge(self, other: "CallContext") -> "CallContext":
         """Fields set on `other` win; unset ones keep this context's value."""
         return replace(

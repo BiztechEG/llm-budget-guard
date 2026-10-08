@@ -45,8 +45,16 @@ class LoopDetected(BudgetError):
         )
 
 
-def _decimal_map(values: Mapping[str, Amount]) -> Dict[str, Decimal]:
-    return {k: to_decimal(v) for k, v in values.items()}
+def _limit(value: Amount) -> Decimal:
+    amount = to_decimal(value)
+    if amount.is_nan() or amount < 0:
+        raise ValueError(f"Limits must be 0 or more, got {value!r}")
+    return amount
+
+
+def _limit_map(values: Mapping[Any, Amount]) -> Dict[str, Decimal]:
+    # Keys are compared as text, so users={42: 5} and users={"42": 5} mean the same user.
+    return {str(k): _limit(v) for k, v in values.items()}
 
 
 @dataclass
@@ -67,23 +75,23 @@ class Limits:
     action: Optional[str] = None  # "raise" or "warn"; None follows the guard's on_exceeded
 
     def __post_init__(self) -> None:
-        self.per_user = to_decimal(self.per_user) if self.per_user is not None else None
-        self.per_feature = to_decimal(self.per_feature) if self.per_feature is not None else None
-        self.daily_total = to_decimal(self.daily_total) if self.daily_total is not None else None
-        self.users = _decimal_map(self.users)
-        self.features = _decimal_map(self.features)
+        self.per_user = _limit(self.per_user) if self.per_user is not None else None
+        self.per_feature = _limit(self.per_feature) if self.per_feature is not None else None
+        self.daily_total = _limit(self.daily_total) if self.daily_total is not None else None
+        self.users = _limit_map(self.users)
+        self.features = _limit_map(self.features)
         if self.action is not None and self.action not in ACTIONS:
             raise ValueError(f"action must be one of {ACTIONS}")
 
-    def for_user(self, user: Optional[str]) -> Optional[Decimal]:
+    def for_user(self, user: Any) -> Optional[Decimal]:
         if user is None:
             return None
-        return self.users.get(user, self.per_user)  # type: ignore[return-value]
+        return self.users.get(str(user), self.per_user)  # type: ignore[return-value]
 
-    def for_feature(self, feature: Optional[str]) -> Optional[Decimal]:
+    def for_feature(self, feature: Any) -> Optional[Decimal]:
         if feature is None:
             return None
-        return self.features.get(feature, self.per_feature)  # type: ignore[return-value]
+        return self.features.get(str(feature), self.per_feature)  # type: ignore[return-value]
 
 
 @dataclass
@@ -110,6 +118,8 @@ _IGNORED_KEYS = frozenset({"stream", "stream_options", "timeout", "extra_headers
 
 
 def _jsonable(value: Any) -> Any:
+    if isinstance(value, type):  # a class, such as the Pydantic model passed to parse(response_format=...)
+        return f"{value.__module__}.{value.__qualname__}"
     dump = getattr(value, "model_dump", None)  # pydantic objects from the SDKs
     return dump() if callable(dump) else repr(value)
 

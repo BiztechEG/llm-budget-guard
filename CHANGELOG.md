@@ -1,6 +1,19 @@
 # Changelog
 
-## 0.1.1 (unreleased)
+## 0.1.2 (unreleased)
+
+Fixes from a code review.
+
+- `parse()` with a Pydantic model (`response_format=`, `text_format=`, `output_format=`) no longer fails with a `TypeError` while loop detection is on.
+- `with_raw_response` and `with_streaming_response` calls, and clients made with Anthropic's `with_middleware()`, now go through the limit and loop checks instead of skipping them. Raw calls are not priced yet; a warning says so once.
+- A stream dropped before its end (for example, the browser disconnected) now counts the usage it had already reported. Anthropic streams report input tokens at the start, so those are no longer lost.
+- `InMemoryStorage` drops expired totals and old request counts every minute, so a long-running process no longer grows without bound.
+- Numeric user and feature ids (`user=request.user.id`) now match overrides keyed by the same id as text, and the reverse.
+- `Limits` rejects NaN, which made every call fail, and negative amounts.
+- Generator arguments (`messages=(m for m in ...)`) are fingerprinted by content, so loop detection sees repeats.
+- A `GuardedClient` can be copied with `copy.copy()`.
+
+## 0.1.1 (2026-10-08)
 
 First release on PyPI, as `budget-guard-llm`. (0.1.0 was tagged as `budget-guard` but never published, because PyPI rejected that name as too similar to `budgetguard`.)
 

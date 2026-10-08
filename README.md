@@ -70,8 +70,9 @@ How the checks behave:
 
 ## Who a call is for
 
-Set defaults when wrapping, then override per request. `budget_context` works across threads and
-asyncio tasks, so it fits request middleware:
+Set defaults when wrapping, then override per request. Ids can be strings or numbers; they're compared
+as text, so `user=42` and `users={"42": 5}` match. `budget_context` works across threads and asyncio
+tasks, so it fits request middleware:
 
 ```python
 from budget_guard import budget_context
@@ -101,12 +102,14 @@ provider, model, user, feature, token usage and cost.
 | OpenAI | `chat.completions.create/parse/stream`, `responses.create/parse/stream`, `completions.create` |
 | Anthropic | `messages.create/parse/stream`, `beta.messages.create/parse/stream` |
 
-Streams are counted when they finish or are closed. For OpenAI chat streams the guard turns on
-`stream_options.include_usage` and hides the extra usage chunk unless you asked for it yourself.
-`client.with_options(...)` stays guarded.
+Streams are counted when they finish, are closed, or are dropped part-way. For OpenAI chat streams the
+guard turns on `stream_options.include_usage` and hides the extra usage chunk unless you asked for it
+yourself. OpenAI only reports usage at the end of a stream, so a stream cut short isn't counted; a warning
+is logged instead. `client.with_options(...)` and Anthropic's `client.with_middleware(...)` stay guarded.
 
-Not tracked yet: `with_raw_response`, `with_streaming_response`, batches, Anthropic's `tool_runner`,
-embeddings, images and audio.
+`with_raw_response` and `with_streaming_response` calls go through the limit and loop checks, but their
+cost isn't counted yet. Not tracked at all yet: batches, Anthropic's `tool_runner`, embeddings, images and
+audio.
 
 ## Prices
 

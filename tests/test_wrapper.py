@@ -1,13 +1,17 @@
 import asyncio
+import copy
+import gc
+import logging
 import warnings
 from datetime import timedelta
 from decimal import Decimal
 
 import httpx2
+import pydantic
 import pytest
 
 import budget_guard
-from budget_guard import BudgetGuard, UnknownModelError, budget_context, guard
+from budget_guard import BudgetExceeded, BudgetGuard, InMemoryStorage, Limits, UnknownModelError, budget_context, guard
 
 from conftest import (
     anthropic_events,
@@ -314,3 +318,92 @@ def test_shared_guard_follows_configure(server, openai_client, clock):
 def test_unrecognised_client_needs_explicit_provider(budget):
     with pytest.raises(TypeError):
         guard(object(), budget=budget)
+
+
+class Answer(pydantic.BaseModel):
+    text: str
+
+
+def test_parse_with_a_pydantic_model(server, openai_client, anthropic_client, budget):
+    # parse() takes the model class itself; the loop check must cope with a class argument.
+    chat = chat_completion("gpt-6-luna", M, 0)
+    chat["choices"][0]["message"]["content"] = '{"text": "hi"}'
+    server.responder = reply_json(chat)
+    client = guard(openai_client, budget=budget)
+    completion = client.chat.completions.parse(model="gpt-6-luna", messages=MSG, response_format=Answer)
+    assert completion.choices[0].message.parsed.text == "hi"
+
+    response = responses_object("gpt-6-luna", M, 0)
+    response["output"][0]["content"][0]["text"] = '{"text": "hi"}'
+    server.responder = reply_json(response)
+    assert client.responses.parse(model="gpt-6-luna", input="hi", text_format=Answer).output_parsed.text == "hi"
+
+    message = anthropic_message("claude-haiku-4-5", 0, 0)
+    message["content"] = [{"type": "text", "text": '{"text": "hi"}'}]
+    server.responder = reply_json(message)
+    guard(anthropic_client, budget=budget).messages.parse(
+        model="claude-haiku-4-5", max_tokens=10, messages=MSG, output_format=Answer
+    )
+
+    assert budget.spent() == Decimal("0.20")
+
+
+def test_stream_abandoned_mid_way_still_counts_what_it_reported(server, anthropic_client, budget):
+    # e.g. the browser disconnected: the input tokens from message_start were billed.
+    server.responder = lambda body: stream_response(sse(anthropic_events("claude-haiku-4-5", M, M), named=True))
+    stream = guard(anthropic_client, budget=budget).messages.create(
+        model="claude-haiku-4-5", max_tokens=10, messages=MSG, stream=True
+    )
+    next(iter(stream))
+    del stream
+    gc.collect()
+    assert budget.spent() == Decimal("1.000005")  # 1M input tokens plus the 1 output token reported so far
+
+
+def test_openai_stream_abandoned_mid_way_is_logged(server, openai_client, budget, caplog):
+    server.responder = lambda body: stream_response(sse(chat_chunks("gpt-6-luna", M, M, with_usage=True), done=True))
+    stream = guard(openai_client, budget=budget).chat.completions.create(model="gpt-6-luna", messages=MSG, stream=True)
+    next(iter(stream))
+    with caplog.at_level(logging.WARNING, logger="budget_guard"):
+        del stream
+        gc.collect()
+    assert any("No usage reported" in r.message for r in caplog.records)
+
+
+def test_raw_response_calls_are_still_checked(server, openai_client, anthropic_client, clock, caplog):
+    server.responder = reply_json(chat_completion("gpt-6-luna", M, 0))
+    budget = BudgetGuard(storage=InMemoryStorage(), clock=clock, limits=Limits(users={"banned": 0}))
+    client = guard(openai_client, budget=budget)
+
+    banned = client.with_context(user="banned")
+    for call in (
+        lambda: banned.chat.completions.with_raw_response.create(model="gpt-6-luna", messages=MSG),
+        lambda: banned.with_raw_response.chat.completions.create(model="gpt-6-luna", messages=MSG),
+        lambda: banned.responses.with_streaming_response.create(model="gpt-6-luna", input="hi"),
+        lambda: guard(anthropic_client, user="banned", budget=budget).messages.with_raw_response.create(
+            model="claude-haiku-4-5", max_tokens=10, messages=MSG
+        ),
+    ):
+        with pytest.raises(BudgetExceeded):
+            call()
+    assert server.requests == []
+
+    with caplog.at_level(logging.WARNING, logger="budget_guard"):
+        raw = client.chat.completions.with_raw_response.create(model="gpt-6-luna", messages=MSG)
+    assert raw.parse().model == "gpt-6-luna"
+    assert any("doesn't count their cost" in r.message for r in caplog.records)
+
+
+def test_with_middleware_stays_guarded(server, anthropic_client, budget):
+    server.responder = reply_json(anthropic_message("claude-haiku-4-5", M, 0))
+    guard(anthropic_client, budget=budget).with_middleware().messages.create(
+        model="claude-haiku-4-5", max_tokens=10, messages=MSG
+    )
+    assert budget.spent() == Decimal("1.00")
+
+
+def test_guarded_client_can_be_copied(server, openai_client, budget):
+    server.responder = reply_json(chat_completion("gpt-6-luna", M, 0))
+    clone = copy.copy(guard(openai_client, user="u1", budget=budget))
+    clone.chat.completions.create(model="gpt-6-luna", messages=MSG)
+    assert budget.spent(user="u1") == Decimal("0.10")
