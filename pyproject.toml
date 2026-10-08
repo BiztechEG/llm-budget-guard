@@ -1,26 +1,51 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "llm-budget-guard"
-version = "0.1.0.dev0"
-description = "Per-user, per-feature and daily spend limits for OpenAI and Anthropic SDK calls."
+name = "budget-guard"
+dynamic = ["version"]
+description = "Per-user, per-feature and daily spend limits, plus loop detection, for OpenAI and Anthropic SDK calls."
 readme = "README.md"
-requires-python = ">=3.9"
-license = { text = "MIT" }
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "BiztechEG" }]
+keywords = ["llm", "openai", "anthropic", "claude", "budget", "cost", "rate limit", "spend"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = []
 
 [project.optional-dependencies]
 openai = ["openai>=3.0"]
 anthropic = ["anthropic>=1.0"]
-dev = ["pytest>=8", "openai>=3.0", "anthropic>=1.0"]
+dev = ["pytest>=8", "openai>=3.0", "anthropic>=1.0", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/BiztechEG/llm-budget-guard"
+Repository = "https://github.com/BiztechEG/llm-budget-guard"
+Issues = "https://github.com/BiztechEG/llm-budget-guard/issues"
+Changelog = "https://github.com/BiztechEG/llm-budget-guard/blob/main/CHANGELOG.md"
+
+[tool.setuptools.dynamic]
+version = { attr = "budget_guard.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-budget_guard = ["pricing.json"]
+budget_guard = ["pricing.json", "py.typed"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
