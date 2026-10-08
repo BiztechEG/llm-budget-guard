@@ -135,7 +135,7 @@ python -m pytest
 ```
 
 The tests run the real OpenAI and Anthropic SDKs against a fake HTTP transport, so nothing is sent and
-nothing is billed.
+nothing is billed. Release steps are in [RELEASING.md](RELEASING.md).
 
 ## License
 
