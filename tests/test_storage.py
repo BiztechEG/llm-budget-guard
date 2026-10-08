@@ -65,3 +65,24 @@ def test_concurrent_adds_are_not_lost():
     for t in threads:
         t.join()
     assert store.get("k") == Decimal("8.000")
+
+
+def test_expired_keys_are_swept():
+    clock = FakeClock()
+    store = InMemoryStorage(clock=clock, sweep_seconds=60)
+    for i in range(1000):
+        store.add(f"spend:old:{i}", Decimal(1), ttl_seconds=10)
+        store.hit(f"loop:{i}", window_seconds=30)
+    store.add("spend:kept", Decimal(1))
+    clock.now += 61
+    store.hit("loop:new", window_seconds=30)  # any write past the sweep interval cleans up
+    assert set(store._totals) == {"spend:kept"}
+    assert set(store._events) == {"loop:new"}
+
+
+def test_live_request_counts_survive_a_sweep():
+    clock = FakeClock()
+    store = InMemoryStorage(clock=clock, sweep_seconds=60)
+    store.hit("loop:slow", window_seconds=300)
+    clock.now += 100
+    assert store.hit("loop:slow", window_seconds=300) == 2

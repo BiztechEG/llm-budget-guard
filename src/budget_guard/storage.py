@@ -39,13 +39,30 @@ class Storage(ABC):
 
 
 class InMemoryStorage(Storage):
-    """Thread-safe, single-process storage. Totals are lost on restart."""
+    """Thread-safe, single-process storage. Totals are lost on restart.
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic):
+    Expired totals and request counts are dropped every `sweep_seconds`, so a
+    long-running process doesn't keep a key for every request it ever saw.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, sweep_seconds: float = 60.0):
         self._clock = clock
         self._lock = threading.Lock()
         self._totals: Dict[str, Tuple[Decimal, Optional[float]]] = {}
         self._events: Dict[str, Deque[float]] = {}
+        self._windows: Dict[str, float] = {}
+        self._sweep_seconds = sweep_seconds
+        self._next_sweep = clock() + sweep_seconds
+
+    def _sweep(self, now: float) -> None:
+        if now < self._next_sweep:
+            return
+        self._next_sweep = now + self._sweep_seconds
+        for key in [k for k, (_, expires_at) in self._totals.items() if expires_at is not None and expires_at <= now]:
+            del self._totals[key]
+        for key in [k for k, events in self._events.items() if not events or events[-1] <= now - self._windows[k]]:
+            del self._events[key]
+            del self._windows[key]
 
     def _live_total(self, key: str, now: float) -> Optional[Tuple[Decimal, Optional[float]]]:
         entry = self._totals.get(key)
@@ -57,6 +74,7 @@ class InMemoryStorage(Storage):
     def add(self, key: str, amount: Decimal, ttl_seconds: Optional[float] = None) -> Decimal:
         with self._lock:
             now = self._clock()
+            self._sweep(now)
             entry = self._live_total(key, now)
             if entry is None:
                 expires_at = now + ttl_seconds if ttl_seconds is not None else None
@@ -74,7 +92,9 @@ class InMemoryStorage(Storage):
     def hit(self, key: str, window_seconds: float) -> int:
         with self._lock:
             now = self._clock()
+            self._sweep(now)
             events = self._events.setdefault(key, deque())
+            self._windows[key] = window_seconds
             cutoff = now - window_seconds
             while events and events[0] <= cutoff:
                 events.popleft()
@@ -85,3 +105,4 @@ class InMemoryStorage(Storage):
         with self._lock:
             self._totals.clear()
             self._events.clear()
+            self._windows.clear()

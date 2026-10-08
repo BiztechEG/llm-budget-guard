@@ -96,7 +96,16 @@ class _TrackedBase:
         self._bg_acc.feed(item)
         return not (self._bg_skip and self._bg_skip(item))
 
+    def __del__(self) -> None:
+        # A stream dropped part-way (say, the browser disconnected) was still billed: count what it reported.
+        try:
+            self._bg_finish()
+        except Exception:
+            pass
+
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("_bg_"):  # not set yet (copy, unpickle, failed __init__); don't recurse
+            raise AttributeError(name)
         return getattr(self._bg_stream, name)
 
 
@@ -215,4 +224,6 @@ class TrackedStreamManager:
             self._bg_on_done(_snapshot(self._bg_stream))
 
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("_bg_"):
+            raise AttributeError(name)
         return getattr(self._bg_manager, name)

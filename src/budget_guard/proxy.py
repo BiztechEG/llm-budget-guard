@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import functools
 import inspect
-from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, Optional, Tuple
+import logging
+from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, Iterator, Optional, Set, Tuple
 
 from .context import CallContext, current_context
 from .streams import (
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
     from .core import BudgetGuard
 
 Path = Tuple[str, ...]
+
+logger = logging.getLogger("budget_guard")
 
 # Billable methods, by attribute path from the client, and how to read their usage.
 # A "_helper" suffix marks `.stream()` context-manager helpers.
@@ -42,13 +45,34 @@ TRACKED: Dict[str, Dict[Path, str]] = {
     },
 }
 
+# `with_raw_response` / `with_streaming_response` variants return HTTP-level responses that
+# aren't priced yet. They still go through the limit and loop checks, so they aren't a way around them.
+UNMETERED = "unmetered:"
+_RAW_ACCESSORS = ("with_raw_response", "with_streaming_response")
+
+
+def _with_unmetered_variants(paths: Dict[Path, str]) -> Dict[Path, str]:
+    out = dict(paths)
+    for path, kind in paths.items():
+        if kind.endswith("_helper"):
+            continue
+        for raw in _RAW_ACCESSORS:
+            out[path[:-1] + (raw, path[-1])] = UNMETERED + kind  # client.chat.completions.with_raw_response.create
+            out[(raw,) + path] = UNMETERED + kind  # client.with_raw_response.chat.completions.create
+    return out
+
+
+_INTERCEPTED: Dict[str, Dict[Path, str]] = {
+    provider: _with_unmetered_variants(paths) for provider, paths in TRACKED.items()
+}
+
 _PREFIXES: Dict[str, FrozenSet[Path]] = {
     provider: frozenset(path[:i] for path in paths for i in range(1, len(path)))
-    for provider, paths in TRACKED.items()
+    for provider, paths in _INTERCEPTED.items()
 }
 
 # Client methods that return a new client; their result gets guarded too.
-_CLIENT_FACTORIES = ("with_options", "copy")
+_CLIENT_FACTORIES = ("with_options", "copy", "with_middleware")
 
 
 def detect_provider(client: Any) -> str:
@@ -61,7 +85,7 @@ def detect_provider(client: Any) -> str:
 
 
 class GuardedClient:
-    """Behaves like the wrapped client. Only the methods in TRACKED are intercepted."""
+    """Behaves like the wrapped client. Only the methods in TRACKED (and their raw variants) are intercepted."""
 
     def __init__(
         self,
@@ -103,11 +127,13 @@ class GuardedClient:
         )
 
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("_bg_"):  # not set yet (copy, unpickle); don't recurse
+            raise AttributeError(name)
         attr = getattr(self._bg_target, name)
         path = self._bg_path + (name,)
-        kind = TRACKED[self._bg_provider].get(path)
+        kind = _INTERCEPTED[self._bg_provider].get(path)
         if kind is not None:
-            return self._bg_wrap_method(attr, kind)
+            return self._bg_wrap_method(attr, kind, path)
         if path in _PREFIXES[self._bg_provider]:
             return GuardedClient(attr, self._bg_guard_obj, self._bg_provider, self._bg_context, path)
         if not self._bg_path and name in _CLIENT_FACTORIES and callable(attr):
@@ -127,13 +153,20 @@ class GuardedClient:
 
         return call
 
-    def _bg_wrap_method(self, method: Callable[..., Any], kind: str) -> Callable[..., Any]:
+    def _bg_wrap_method(self, method: Callable[..., Any], kind: str, path: Path) -> Callable[..., Any]:
         provider = self._bg_provider
 
         @functools.wraps(method)
         def call(*args: Any, **kwargs: Any) -> Any:
             guard = self._bg_guard
             ctx = self._bg_context.merge(current_context())
+            for key, value in list(kwargs.items()):
+                if isinstance(value, Iterator):  # generators can be read only once, and the SDK still needs them
+                    kwargs[key] = list(value)
+            if kind.startswith(UNMETERED):
+                guard.before_call(provider, kind[len(UNMETERED):], kwargs, ctx)
+                _warn_unmetered(provider, path)
+                return method(*args, **kwargs)
             hide_usage_chunk = _prepare_kwargs(kind, kwargs)
             guard.before_call(provider, kind, kwargs, ctx)
 
@@ -163,6 +196,18 @@ class GuardedClient:
             return handle(result)
 
         return call
+
+
+_warned_unmetered: Set[Tuple[str, Path]] = set()
+
+
+def _warn_unmetered(provider: str, path: Path) -> None:
+    if (provider, path) in _warned_unmetered:
+        return
+    _warned_unmetered.add((provider, path))
+    logger.warning(
+        "budget_guard checks limits for %s.%s calls but doesn't count their cost yet.", provider, ".".join(path)
+    )
 
 
 def _prepare_kwargs(kind: str, kwargs: Dict[str, Any]) -> bool:

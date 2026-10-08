@@ -238,3 +238,35 @@ def test_fingerprint_ignores_transport_options():
     assert a == fingerprint("openai", "openai_chat_helper", base, ctx)
     assert a != fingerprint("openai", "openai_chat", {**base, "temperature": 0.5}, ctx)
     assert a != fingerprint("openai", "openai_chat", base, CallContext("u2", "chat"))
+
+
+def test_numeric_ids_match_text_ids(server, openai_client, clock, luna):
+    # request.user.id is often an int; overrides keyed by "42" (or 42) must still apply.
+    budget = make_guard(clock, limits=Limits(per_user="0.10", users={"42": "1.00"}, features={7: "0.05"}))
+    ask(guard(openai_client, user=42, budget=budget))
+    ask(guard(openai_client, user=42, budget=budget), "2")  # under the 1.00 override, not the 0.10 default
+    assert budget.spent(user="42") == budget.spent(user=42) == Decimal("0.20")
+    assert budget.remaining(user=42) == Decimal("0.80")
+
+    ask(guard(openai_client, feature=7, budget=budget))
+    with pytest.raises(BudgetExceeded):
+        ask(guard(openai_client, feature="7", budget=budget), "again")
+
+
+@pytest.mark.parametrize("bad", [float("nan"), "NaN", -1])
+def test_nonsense_limits_are_rejected(bad):
+    with pytest.raises(ValueError):
+        Limits(per_user=bad)
+    with pytest.raises(ValueError):
+        Limits(users={"u": bad})
+
+
+def test_generator_arguments_are_fingerprinted_by_content(server, openai_client, clock, luna):
+    budget = make_guard(clock, loop_detection=LoopDetection(max_repeats=2))
+    client = guard(openai_client, budget=budget)
+    generators = [(m for m in MSG) for _ in range(3)]  # all alive at once, so their reprs differ
+    for messages in generators[:2]:
+        client.chat.completions.create(model="gpt-6-luna", messages=messages)
+    with pytest.raises(LoopDetected):
+        client.chat.completions.create(model="gpt-6-luna", messages=generators[2])
+    assert server.requests[0]["messages"] == MSG  # the SDK still received the messages

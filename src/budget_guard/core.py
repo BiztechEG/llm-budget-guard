@@ -171,7 +171,10 @@ class BudgetGuard:
         """Price a finished response and add it to the totals. Never raises."""
         try:
             if response is None:
-                logger.warning("No usage reported for a %s call; it was not counted.", provider)
+                logger.warning(
+                    "No usage reported for a %s call (a stream closed before its last chunk?); it was not counted.",
+                    provider,
+                )
                 return None
             model, usage = extract_usage(response, provider)
             return self.record(provider, model or fallback_model, usage, ctx)
