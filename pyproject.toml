@@ -12,9 +12,9 @@ license = { text = "MIT" }
 dependencies = []
 
 [project.optional-dependencies]
-openai = ["openai>=1.0"]
-anthropic = ["anthropic>=0.30"]
-dev = ["pytest>=8"]
+openai = ["openai>=3.0"]
+anthropic = ["anthropic>=1.0"]
+dev = ["pytest>=8", "openai>=3.0", "anthropic>=1.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
