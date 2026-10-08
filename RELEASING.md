@@ -10,7 +10,7 @@ package, checks it, and publishes it with PyPI trusted publishing, so no API tok
 
    | Field | Value |
    |---|---|
-   | PyPI project name | `budget-guard` (must match `name` in `pyproject.toml`) |
+   | PyPI project name | `llm-spend-guard` (must match `name` in `pyproject.toml`) |
    | Owner | `BiztechEG` |
    | Repository name | `llm-budget-guard` |
    | Workflow name | `release.yml` |
@@ -34,7 +34,7 @@ package, checks it, and publishes it with PyPI trusted publishing, so no API tok
    ```
 
 5. Watch the *Release* run under the repo's *Actions* tab (and approve it if you set up required reviewers).
-6. Check it installs: `pip install budget-guard==0.1.1`.
+6. Check it installs: `pip install llm-spend-guard==0.1.1`.
 
 The workflow refuses a tag that doesn't match `__version__`, so a typo stops the release instead of
 publishing the wrong version.
