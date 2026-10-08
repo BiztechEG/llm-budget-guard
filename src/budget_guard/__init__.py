@@ -1,7 +1,8 @@
 """Spend limits for LLM SDK calls."""
 
 from .context import CallContext, budget_context
-from .core import BudgetGuard, CallRecord, configure, get_default_guard, guard, spent
+from .core import BudgetGuard, CallRecord, configure, get_default_guard, guard, remaining, spent
+from .limits import BudgetError, BudgetExceeded, Limits, LoopDetected, LoopDetection
 from .cost import Cost, calculate_cost, cost_of_response, default_pricing
 from .pricing import ModelPrice, PricingTable, UnknownModelError
 from .storage import InMemoryStorage, Storage
@@ -10,11 +11,16 @@ from .usage import Usage, extract_usage
 __version__ = "0.1.0.dev0"
 
 __all__ = [
+    "BudgetError",
+    "BudgetExceeded",
     "BudgetGuard",
     "CallContext",
     "CallRecord",
     "Cost",
     "InMemoryStorage",
+    "Limits",
+    "LoopDetected",
+    "LoopDetection",
     "ModelPrice",
     "PricingTable",
     "Storage",
@@ -28,5 +34,6 @@ __all__ = [
     "extract_usage",
     "get_default_guard",
     "guard",
+    "remaining",
     "spent",
 ]

@@ -2,7 +2,7 @@
 
 Spend limits for OpenAI and Anthropic SDK calls: per user, per feature, and a daily total, plus loop detection.
 
-Status: steps 1 and 2 of 4 done (pricing, cost, storage, SDK wrapper). Limits and loop detection come next.
+Status: steps 1 to 3 of 4 done (pricing, cost, storage, SDK wrapper, limits, loop detection). Packaging for PyPI comes next.
 
 ## Two lines
 
@@ -29,6 +29,33 @@ with budget_context(user=request.user.id):
 ```
 
 Or a re-scoped copy: `client.with_context(user="u2")`.
+
+## Limits and loop detection
+
+Set them once at startup:
+
+```python
+import budget_guard
+from budget_guard import Limits, LoopDetection
+
+budget_guard.configure(
+    limits=Limits(per_user=1.00, users={"vip": 20}, features={"chat": 5}, daily_total=50),
+    loop_detection=LoopDetection(max_repeats=10, window_seconds=60),  # this is the default
+    on_exceeded="raise",       # or "warn" to log and let the call through
+    on_violation=alert_me,     # optional: called with the error in either mode
+)
+```
+
+All limits are daily, in USD, and reset at midnight UTC. Once a total reaches its cap, the next call
+raises `BudgetExceeded` before anything is sent. The call that crosses the cap is still allowed, because
+its cost is only known after it returns. Concurrent calls can overshoot by up to one call each.
+
+A loop is the same request (same model, messages and options, same user and feature) sent more than
+`max_repeats` times inside `window_seconds`. The next one raises `LoopDetected`. Pass
+`loop_detection=None` to turn it off. `Limits` and `LoopDetection` each take `action="raise"|"warn"`
+to override `on_exceeded`.
+
+Both errors subclass `BudgetError`. `budget_guard.remaining(user="u1")` returns what is left today.
 
 ## What is tracked
 

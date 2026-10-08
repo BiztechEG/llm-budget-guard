@@ -7,10 +7,11 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Callable, List, Mapping, Optional
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Tuple, Union
 
 from .context import CallContext
 from .cost import calculate_cost, default_pricing
+from .limits import ACTIONS, BudgetError, BudgetExceeded, Limits, LoopDetection, LoopDetected, fingerprint
 from .pricing import PricingTable, UnknownModelError
 from .storage import InMemoryStorage, Storage
 from .usage import Usage, extract_usage
@@ -30,18 +31,30 @@ class CallRecord:
     day: str
 
 
-class BudgetGuard:
-    """Holds pricing, storage and settings shared by every client it wraps.
+_DAY_TTL = 2 * 24 * 3600  # keep yesterday around for reporting, then let it expire
 
-    on_unknown_model:
-        "warn"   (default) let the call through, record nothing, warn once per model.
-        "ignore" same, without the warning.
-        "raise"  refuse calls to unpriced models before they are sent.
+
+class BudgetGuard:
+    """Holds pricing, storage, limits and settings shared by every client it wraps.
+
+    limits:           a `Limits` (or a dict of its fields). None means no caps.
+    loop_detection:   a `LoopDetection`; on by default (10 identical requests in 60s). None turns it off.
+    on_exceeded:      "raise" (default) stops the call with BudgetExceeded / LoopDetected;
+                      "warn" logs a warning and lets it through. Limits and LoopDetection
+                      can override this with their own `action`.
+    on_violation:     called with the BudgetError each time a limit or loop check trips,
+                      in either mode, before raising or warning.
+    on_unknown_model: "warn" (default) lets the call through uncounted and warns once per model;
+                      "ignore" does the same silently; "raise" refuses unpriced models before sending.
     """
 
     def __init__(
         self,
         *,
+        limits: Union[Limits, Mapping[str, Any], None] = None,
+        loop_detection: Optional[LoopDetection] = LoopDetection(),
+        on_exceeded: str = "raise",
+        on_violation: Optional[Callable[[BudgetError], None]] = None,
         pricing: Optional[PricingTable] = None,
         storage: Optional[Storage] = None,
         on_unknown_model: str = "warn",
@@ -50,6 +63,12 @@ class BudgetGuard:
     ):
         if on_unknown_model not in _UNKNOWN_MODEL_MODES:
             raise ValueError(f"on_unknown_model must be one of {_UNKNOWN_MODEL_MODES}")
+        if on_exceeded not in ACTIONS:
+            raise ValueError(f"on_exceeded must be one of {ACTIONS}")
+        self.limits = Limits(**limits) if isinstance(limits, Mapping) else limits
+        self.loop_detection = loop_detection
+        self.on_exceeded = on_exceeded
+        self._violation_listeners: List[Callable[[BudgetError], None]] = [on_violation] if on_violation else []
         self.pricing = pricing or default_pricing()
         self.storage = storage or InMemoryStorage()
         self.on_unknown_model = on_unknown_model
@@ -77,8 +96,36 @@ class BudgetGuard:
             return self.storage.get(self._key(day, "feature", feature))
         return self.storage.get(self._key(day, "total"))
 
+    def remaining(self, *, user: Optional[str] = None, feature: Optional[str] = None) -> Optional[Decimal]:
+        """USD left today under the matching limit, or None if that scope has no limit."""
+        if user is not None and feature is not None:
+            raise ValueError("Pass user or feature, not both.")
+        if self.limits is None:
+            return None
+        if user is not None:
+            limit = self.limits.for_user(user)
+        elif feature is not None:
+            limit = self.limits.for_feature(feature)
+        else:
+            limit = self.limits.daily_total  # type: ignore[assignment]
+        if limit is None:
+            return None
+        return max(Decimal(0), limit - self.spent(user=user, feature=feature))
+
     def add_listener(self, listener: Callable[[CallRecord], None]) -> None:
         self._listeners.append(listener)
+
+    def add_violation_listener(self, listener: Callable[[BudgetError], None]) -> None:
+        self._violation_listeners.append(listener)
+
+    def _scopes(self, ctx: CallContext) -> Iterable[Tuple[str, Optional[str], str, Optional[Decimal]]]:
+        """(scope, name, storage key suffix, limit) for each total this call counts toward."""
+        limits = self.limits
+        yield "daily", None, "total", limits.daily_total if limits else None  # type: ignore[misc]
+        if ctx.user is not None:
+            yield "user", ctx.user, f"user:{ctx.user}", limits.for_user(ctx.user) if limits else None
+        if ctx.feature is not None:
+            yield "feature", ctx.feature, f"feature:{ctx.feature}", limits.for_feature(ctx.feature) if limits else None
 
     # -- call lifecycle -------------------------------------------------------
 
@@ -87,6 +134,32 @@ class BudgetGuard:
         model = kwargs.get("model")
         if self.on_unknown_model == "raise" and isinstance(model, str):
             self.pricing.get(model, provider)
+
+        if self.limits is not None:
+            day = self.today()
+            for scope, name, suffix, limit in self._scopes(ctx):
+                if limit is None:
+                    continue
+                spent = self.storage.get(f"spend:{day}:{suffix}")
+                if spent >= limit:
+                    self._violation(BudgetExceeded(scope, name, limit, spent), self.limits.action)
+
+        loops = self.loop_detection
+        if loops is not None:
+            fp = fingerprint(provider, kind, kwargs, ctx)
+            count = self.storage.hit(f"loop:{fp}", loops.window_seconds)
+            if count > loops.max_repeats:
+                self._violation(LoopDetected(fp, count, loops.window_seconds, ctx), loops.action)
+
+    def _violation(self, error: BudgetError, action: Optional[str]) -> None:
+        for listener in self._violation_listeners:
+            try:
+                listener(error)
+            except Exception:
+                logger.exception("budget_guard on_violation listener failed")
+        if (action or self.on_exceeded) == "raise":
+            raise error
+        logger.warning("%s The call was allowed because the action is 'warn'.", error)
 
     def record_response(
         self,
@@ -117,12 +190,11 @@ class BudgetGuard:
             return None
         cost = calculate_cost(usage, price)
         day = self.today()
-        ttl = 2 * 24 * 3600  # keep yesterday around for reporting, then let it expire
-        self.storage.add(self._key(day, "total"), cost, ttl)
-        if ctx.user is not None:
-            self.storage.add(self._key(day, "user", ctx.user), cost, ttl)
-        if ctx.feature is not None:
-            self.storage.add(self._key(day, "feature", ctx.feature), cost, ttl)
+        for scope, name, suffix, limit in self._scopes(ctx):
+            total = self.storage.add(f"spend:{day}:{suffix}", cost, _DAY_TTL)
+            if limit is not None and total >= limit > total - cost:
+                who = "Daily total" if scope == "daily" else f"Daily budget for {scope} {name!r}"
+                logger.warning("%s reached: $%.4f of $%.4f.", who, total, limit)
         record = CallRecord(provider=provider, model=model, context=ctx, usage=usage, cost=cost, day=day)
         for listener in self._listeners:
             try:
@@ -165,8 +237,14 @@ def get_default_guard() -> BudgetGuard:
 
 
 def configure(**settings: Any) -> BudgetGuard:
-    """Replace the shared guard used by `guard()` with one built from these settings."""
+    """Replace the shared guard used by `guard()` with one built from these settings.
+
+    Clients already wrapped with `guard()` pick up the new settings. Unless `storage`
+    is given, the previous guard's storage is kept so today's totals aren't lost.
+    """
     global _default_guard
+    if "storage" not in settings and _default_guard is not None:
+        settings["storage"] = _default_guard.storage
     _default_guard = BudgetGuard(**settings)
     return _default_guard
 
@@ -190,3 +268,8 @@ def guard(
 def spent(*, user: Optional[str] = None, feature: Optional[str] = None, day: Optional[str] = None) -> Decimal:
     """Spend so far on the shared guard."""
     return get_default_guard().spent(user=user, feature=feature, day=day)
+
+
+def remaining(*, user: Optional[str] = None, feature: Optional[str] = None) -> Optional[Decimal]:
+    """Budget left today on the shared guard, or None when that scope has no limit."""
+    return get_default_guard().remaining(user=user, feature=feature)
