@@ -1,16 +1,16 @@
-# llm-spend-guard
+# budget-guard-llm
 
 Stop one user, one feature or one runaway loop from burning through your OpenAI or Anthropic bill.
 
-`llm-spend-guard` wraps the official SDK clients, prices every call from the tokens the response actually
+`budget-guard-llm` wraps the official SDK clients, prices every call from the tokens the response actually
 used, and enforces daily spend limits per user, per feature and in total. It also catches the same
 request being sent over and over in a short time, which is what a stuck retry loop or agent looks like.
 
 ```bash
-pip install llm-spend-guard
+pip install budget-guard-llm
 ```
 
-The package installs as `llm-spend-guard` and imports as `budget_guard`.
+The package installs as `budget-guard-llm` and imports as `budget_guard`.
 
 ## Two lines
 

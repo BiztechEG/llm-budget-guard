@@ -2,7 +2,7 @@
 
 ## 0.1.1 (unreleased)
 
-First release on PyPI, as `llm-spend-guard`. (0.1.0 was tagged as `budget-guard` but never published, because PyPI rejected that name.)
+First release on PyPI, as `budget-guard-llm`. (0.1.0 was tagged as `budget-guard` but never published, because PyPI rejected that name as too similar to `budgetguard`.)
 
 - `guard(client, user=..., feature=...)` wraps OpenAI and Anthropic clients, sync and async, including streams and `.stream()` helpers.
 - Cost from the tokens each response actually used, including cached input and long-context rates, from an updatable price table.
