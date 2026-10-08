@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "budget-guard"
+name = "llm-spend-guard"
 dynamic = ["version"]
 description = "Per-user, per-feature and daily spend limits, plus loop detection, for OpenAI and Anthropic SDK calls."
 readme = "README.md"
