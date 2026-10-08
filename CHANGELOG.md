@@ -4,6 +4,8 @@
 
 Fixes from a code review.
 
+- Calls still running now count toward limits at an estimated cost, so parallel calls can't all pass a limit before the first one is recorded. In a test, 20 parallel calls against a $0.10 limit used to spend $2.00; now one goes through. The estimate comes from the request's text and its `max_tokens` (`reserve_output_tokens=` when it sets none). `BudgetExceeded.reserved` holds the amount held by calls still running.
+- An OpenAI stream closed before its last chunk is counted at its estimated cost instead of not at all.
 - `parse()` with a Pydantic model (`response_format=`, `text_format=`, `output_format=`) no longer fails with a `TypeError` while loop detection is on.
 - `with_raw_response` and `with_streaming_response` calls, and clients made with Anthropic's `with_middleware()`, now go through the limit and loop checks instead of skipping them. Raw calls are not priced yet; a warning says so once.
 - A stream dropped before its end (for example, the browser disconnected) now counts the usage it had already reported. Anthropic streams report input tokens at the start, so those are no longer lost.

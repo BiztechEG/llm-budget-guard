@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import logging
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Iterable, List, Mapping, Optional, Tuple, Union
 
 from .context import CallContext
 from .cost import calculate_cost, default_pricing
+from .estimate import estimate_usage
 from .limits import ACTIONS, BudgetError, BudgetExceeded, Limits, LoopDetection, LoopDetected, fingerprint
 from .pricing import PricingTable, UnknownModelError
 from .storage import InMemoryStorage, Storage
@@ -31,6 +32,16 @@ class CallRecord:
     day: str
 
 
+@dataclass
+class Reservation:
+    """Budget held for a call in flight, from an estimate of its cost, until it finishes."""
+
+    model: str
+    estimate: Usage
+    amount: Decimal
+    keys: List[str] = field(default_factory=list)
+
+
 _DAY_TTL = 2 * 24 * 3600  # keep yesterday around for reporting, then let it expire
 
 
@@ -46,6 +57,8 @@ class BudgetGuard:
                       in either mode, before raising or warning.
     on_unknown_model: "warn" (default) lets the call through uncounted and warns once per model;
                       "ignore" does the same silently; "raise" refuses unpriced models before sending.
+    reserve_output_tokens: output tokens assumed for a call that sets no max_tokens, when estimating
+                      the cost of calls still running (see `before_call`).
     """
 
     def __init__(
@@ -60,6 +73,7 @@ class BudgetGuard:
         on_unknown_model: str = "warn",
         on_record: Optional[Callable[[CallRecord], None]] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        reserve_output_tokens: int = 1024,
     ):
         if on_unknown_model not in _UNKNOWN_MODEL_MODES:
             raise ValueError(f"on_unknown_model must be one of {_UNKNOWN_MODEL_MODES}")
@@ -75,6 +89,7 @@ class BudgetGuard:
         self._listeners: List[Callable[[CallRecord], None]] = [on_record] if on_record else []
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._warned_models: set = set()
+        self.reserve_output_tokens = reserve_output_tokens
 
     # -- keys ---------------------------------------------------------------
 
@@ -129,27 +144,65 @@ class BudgetGuard:
 
     # -- call lifecycle -------------------------------------------------------
 
-    def before_call(self, provider: str, kind: str, kwargs: Mapping[str, Any], ctx: CallContext) -> None:
-        """Runs before a request is sent. Raising here stops the request."""
+    def before_call(
+        self, provider: str, kind: str, kwargs: Mapping[str, Any], ctx: CallContext, *, reserve: bool = True
+    ) -> Optional[Reservation]:
+        """Runs before a request is sent. Raising here stops the request.
+
+        Calls still running count toward each limit at their estimated cost, so a burst of
+        parallel calls can't all pass the check before the first one is recorded. The returned
+        reservation holds that estimate; pass it to `record_response` or `release` when the call ends.
+        """
         model = kwargs.get("model")
         if self.on_unknown_model == "raise" and isinstance(model, str):
             self.pricing.get(model, provider)
 
-        if self.limits is not None:
-            day = self.today()
-            for scope, name, suffix, limit in self._scopes(ctx):
-                if limit is None:
-                    continue
-                spent = self.storage.get(f"spend:{day}:{suffix}")
-                if spent >= limit:
-                    self._violation(BudgetExceeded(scope, name, limit, spent), self.limits.action)
+        # Also kept without limits: it's what a stream that ends without reporting usage is charged.
+        reservation = self._estimate(provider, model, kwargs) if reserve else None
+        try:
+            if self.limits is not None:
+                day = self.today()
+                scopes = [s for s in self._scopes(ctx) if s[3] is not None]
+                for scope, name, suffix, limit in scopes:
+                    spent = self.storage.get(f"spend:{day}:{suffix}")
+                    pending_key = f"pending:{day}:{suffix}"
+                    if reservation is not None:
+                        # add() is atomic, so of two parallel calls only the first sees nothing held before it.
+                        held = self.storage.add(pending_key, reservation.amount, _DAY_TTL) - reservation.amount
+                        reservation.keys.append(pending_key)
+                    else:
+                        held = self.storage.get(pending_key)
+                    if spent + held >= limit:
+                        self._violation(BudgetExceeded(scope, name, limit, spent, held), self.limits.action)
 
-        loops = self.loop_detection
-        if loops is not None:
-            fp = fingerprint(provider, kind, kwargs, ctx)
-            count = self.storage.hit(f"loop:{fp}", loops.window_seconds)
-            if count > loops.max_repeats:
-                self._violation(LoopDetected(fp, count, loops.window_seconds, ctx), loops.action)
+            loops = self.loop_detection
+            if loops is not None:
+                fp = fingerprint(provider, kind, kwargs, ctx)
+                count = self.storage.hit(f"loop:{fp}", loops.window_seconds)
+                if count > loops.max_repeats:
+                    self._violation(LoopDetected(fp, count, loops.window_seconds, ctx), loops.action)
+        except BaseException:
+            self.release(reservation)
+            raise
+        return reservation
+
+    def _estimate(self, provider: str, model: Any, kwargs: Mapping[str, Any]) -> Optional[Reservation]:
+        if not isinstance(model, str):
+            return None
+        try:
+            price = self.pricing.get(model, provider)
+        except UnknownModelError:
+            return None  # unpriced calls aren't counted, so there is nothing to hold
+        usage = estimate_usage(kwargs, self.reserve_output_tokens)
+        return Reservation(model=model, estimate=usage, amount=calculate_cost(usage, price))
+
+    def release(self, reservation: Optional[Reservation]) -> None:
+        """Stop holding a reservation's estimate. Safe to call more than once."""
+        if reservation is None:
+            return
+        keys, reservation.keys = reservation.keys, []
+        for key in keys:
+            self.storage.add(key, -reservation.amount, _DAY_TTL)
 
     def _violation(self, error: BudgetError, action: Optional[str]) -> None:
         for listener in self._violation_listeners:
@@ -167,10 +220,22 @@ class BudgetGuard:
         provider: str,
         ctx: CallContext,
         fallback_model: Optional[str] = None,
+        reservation: Optional[Reservation] = None,
     ) -> Optional[CallRecord]:
-        """Price a finished response and add it to the totals. Never raises."""
+        """Price a finished response, add it to the totals and release its reservation. Never raises.
+
+        With no usage to read (an OpenAI stream closed before its last chunk), the call is
+        counted at its reserved estimate rather than not at all.
+        """
         try:
             if response is None:
+                if reservation is not None:
+                    logger.warning(
+                        "No usage reported for a %s call (a stream closed before its last chunk?); "
+                        "counting its estimated cost instead.",
+                        provider,
+                    )
+                    return self.record(provider, reservation.model, reservation.estimate, ctx)
                 logger.warning(
                     "No usage reported for a %s call (a stream closed before its last chunk?); it was not counted.",
                     provider,
@@ -181,6 +246,12 @@ class BudgetGuard:
         except Exception:
             logger.exception("budget_guard failed to record a %s call", provider)
             return None
+        finally:
+            # Released after recording, so the call is never missing from both totals at once.
+            try:
+                self.release(reservation)
+            except Exception:
+                logger.exception("budget_guard failed to release a reservation")
 
     def record(self, provider: str, model: Optional[str], usage: Usage, ctx: CallContext) -> Optional[CallRecord]:
         if not model:
