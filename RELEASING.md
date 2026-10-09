@@ -22,19 +22,19 @@ package, checks it, and publishes it with PyPI trusted publishing, so no API tok
 
 ## Each release
 
-1. On a branch, set the new version in `src/budget_guard/__init__.py` (`__version__ = "0.1.1"`).
+1. On a branch, set the new version in `src/budget_guard/__init__.py` (`__version__ = "0.1.2"`).
 2. In `CHANGELOG.md`, replace `(unreleased)` with today's date and list what changed.
 3. Open a PR, wait for CI to pass, and merge it.
 4. Tag the merge commit on `main` and push the tag:
 
    ```bash
    git checkout main && git pull
-   git tag v0.1.1
-   git push origin v0.1.1
+   git tag v0.1.2
+   git push origin v0.1.2
    ```
 
 5. Watch the *Release* run under the repo's *Actions* tab (and approve it if you set up required reviewers).
-6. Check it installs: `pip install budget-guard-llm==0.1.1`.
+6. Check it installs: `pip install budget-guard-llm==0.1.2`.
 
 The workflow refuses a tag that doesn't match `__version__`, so a typo stops the release instead of
 publishing the wrong version.
